@@ -72,6 +72,12 @@ df["demand_roll_mean_24"]  = df["Demand"].shift(1).rolling(24).mean()
 df["demand_roll_std_24"]   = df["Demand"].shift(1).rolling(24).std()
 df["demand_roll_mean_168"] = df["Demand"].shift(1).rolling(168).mean()
 
+# Monthly aggregation features (for monthly forecasting)
+df["demand_roll_mean_720"]  = df["Demand"].shift(1).rolling(720).mean()   # ~30 days
+df["demand_roll_std_720"]   = df["Demand"].shift(1).rolling(720).std()    # ~30 days
+df["demand_roll_max_720"]   = df["Demand"].shift(1).rolling(720).max()    # ~30 days
+df["demand_roll_min_720"]   = df["Demand"].shift(1).rolling(720).min()    # ~30 days
+
 df.dropna(inplace=True)
 df.reset_index(drop=True, inplace=True)
 print(f"[Features] After lag/rolling creation: {len(df):,} rows, {df.shape[1]} columns")
@@ -84,6 +90,8 @@ FEATURES = [
     "demand_lag_6", "demand_lag_12", "demand_lag_24",
     "demand_lag_48", "demand_lag_168",
     "demand_roll_mean_24", "demand_roll_std_24", "demand_roll_mean_168",
+    "demand_roll_mean_720", "demand_roll_std_720",   # Monthly features
+    "demand_roll_max_720", "demand_roll_min_720",    # Monthly features
 ]
 TARGET = "Demand"
 
@@ -387,7 +395,26 @@ def load_models_and_scalers(models_dir="outputs/saved_models"):
     """Load trained models and scalers."""
     with open(os.path.join(models_dir, "xgboost_model.pkl"), "rb") as f:
         xgb_m = pickle.load(f)
-    lstm_m = tf.keras.models.load_model(os.path.join(models_dir, "lstm_model.h5"))
+
+    # Load LSTM model with error handling for deserialization issues
+    lstm_model_path = os.path.join(models_dir, "lstm_model.h5")
+    try:
+        lstm_m = tf.keras.models.load_model(lstm_model_path)
+    except ValueError as e:
+        if "Could not deserialize" in str(e):
+            print(f"[Warning] Deserialization issue with LSTM model: {e}")
+            print("[Info] Attempting to load model with custom objects...")
+            # Try loading with custom objects to handle metric deserialization
+            lstm_m = tf.keras.models.load_model(lstm_model_path, custom_objects={
+                'mse': tf.keras.losses.MeanSquaredError(),
+                'mae': tf.keras.metrics.MeanAbsoluteError()
+            })
+            # Recompile the model to ensure it's ready for use
+            lstm_m.compile(optimizer="adam", loss="mse", metrics=["mae"])
+            print("[Success] LSTM model loaded and recompiled successfully")
+        else:
+            raise e
+
     with open(os.path.join(models_dir, "feature_scaler.pkl"), "rb") as f:
         feat_sc = pickle.load(f)
     with open(os.path.join(models_dir, "target_scaler.pkl"), "rb") as f:
@@ -432,10 +459,16 @@ def prepare_features_for_prediction(new_data, historical_data, features_list, lo
     for lag in [1, 2, 3, 6, 12, 24, 48, 168]:
         combined[f"demand_lag_{lag}"] = combined["Demand"].shift(lag)
     
-    # Rolling statistics
+    # Rolling statistics (hourly)
     combined["demand_roll_mean_24"]  = combined["Demand"].shift(1).rolling(24).mean()
     combined["demand_roll_std_24"]   = combined["Demand"].shift(1).rolling(24).std()
     combined["demand_roll_mean_168"] = combined["Demand"].shift(1).rolling(168).mean()
+    
+    # Rolling statistics (monthly: ~30 days = 720 hours)
+    combined["demand_roll_mean_720"] = combined["Demand"].shift(1).rolling(720).mean()
+    combined["demand_roll_std_720"]  = combined["Demand"].shift(1).rolling(720).std()
+    combined["demand_roll_max_720"]  = combined["Demand"].shift(1).rolling(720).max()
+    combined["demand_roll_min_720"]  = combined["Demand"].shift(1).rolling(720).min()
     
     # Extract only the new data rows (with all features)
     result = combined.iloc[-len(new_data):].copy()
@@ -527,7 +560,132 @@ def predict_future_demand(new_data, model_type="both", models_dir="outputs/saved
     
     return results
 
+def predict_monthly_demand(previous_month_data, model_type="both", models_dir="outputs/saved_models"):
+    """
+    Predict next month's electricity demand using previous month's data.
+    
+    Parameters:
+    -----------
+    previous_month_data : pd.DataFrame
+        Daily or hourly data from the previous month with columns:
+        Demand, Temperature, Humidity, hour, dayofweek, month, year, dayofyear
+        Must have at least 720 hourly records (30 days) for meaningful monthly features.
+    model_type : str
+        "xgboost", "lstm", or "both" (default)
+    models_dir : str
+        Path to saved models directory
+        
+    Returns:
+    --------
+    dict with:
+        - "monthly_demand_forecast": forecasted average daily demand for next month (MW)
+        - "monthly_demand_range": (min, max) expected range for next month
+        - "daily_forecasts": array of hourly/daily forecasts if using hourly input
+        - "previous_month_avg": actual average demand from previous month
+        - "monthly_growth": expected change from previous month to next month
+    """
+    # Load models and config
+    xgb_m, lstm_m, feat_sc, targ_sc, cfg = load_models_and_scalers(models_dir)
+    df_hist = pd.read_csv(DATA_PATH)
+    df_hist.dropna(subset=cfg["TARGET"], inplace=True)
+    
+    # Calculate previous month statistics
+    prev_month_avg = previous_month_data["Demand"].mean()
+    prev_month_max = previous_month_data["Demand"].max()
+    prev_month_min = previous_month_data["Demand"].min()
+    prev_month_std = previous_month_data["Demand"].std()
+    
+    print(f"\n[Monthly Analysis] Previous Month Statistics:")
+    print(f"  Average Demand:  {prev_month_avg:,.1f} MW")
+    print(f"  Max Demand:      {prev_month_max:,.1f} MW")
+    print(f"  Min Demand:      {prev_month_min:,.1f} MW")
+    print(f"  Std Deviation:   {prev_month_std:,.1f} MW")
+    
+    # Use the full previous month data + historical for features
+    combined = pd.concat([df_hist, previous_month_data], ignore_index=True)
+    combined = combined.drop_duplicates(subset=['year', 'month', 'dayofyear', 'hour'], keep='first')
+    
+    # Create features from combined data
+    X_monthly = prepare_features_for_prediction(
+        previous_month_data, 
+        df_hist, 
+        cfg["FEATURES"], 
+        cfg["LOOKBACK"]
+    )
+    
+    if len(X_monthly) == 0:
+        print("[Error] Could not prepare monthly features from provided data.")
+        return {
+            "monthly_demand_forecast": prev_month_avg,
+            "previous_month_avg": prev_month_avg,
+            "error": "Insufficient data for feature engineering"
+        }
+    
+    results = {
+        "previous_month_avg": prev_month_avg,
+        "previous_month_max": prev_month_max,
+        "previous_month_min": prev_month_min,
+        "previous_month_std": prev_month_std,
+        "n_records_analyzed": len(previous_month_data),
+    }
+    
+    # Make predictions for the period
+    if model_type in ["xgboost", "both"]:
+        pred_xgb = forecast_xgboost(X_monthly, xgb_m, feat_sc, cfg["FEATURES"])
+        results["xgboost_forecasts"] = pred_xgb
+        results["xgboost_monthly_avg"] = pred_xgb.mean()
+        results["xgboost_monthly_std"] = pred_xgb.std()
+        results["xgboost_growth_pct"] = ((pred_xgb.mean() - prev_month_avg) / prev_month_avg) * 100
+        print(f"\n[XGBoost Monthly Forecast]")
+        print(f"  Predicted Avg:   {pred_xgb.mean():,.1f} MW")
+        print(f"  Predicted Range: {pred_xgb.min():,.1f} - {pred_xgb.max():,.1f} MW")
+        print(f"  Growth vs Prev:  {results['xgboost_growth_pct']:+.2f}%")
+    
+    if model_type in ["lstm", "both"]:
+        X_monthly_scaled = feat_sc.transform(X_monthly)
+        pred_lstm = forecast_lstm(pd.DataFrame(X_monthly_scaled), cfg["LOOKBACK"], lstm_m, targ_sc)
+        if len(pred_lstm) > 0:
+            results["lstm_forecasts"] = pred_lstm
+            results["lstm_monthly_avg"] = pred_lstm.mean()
+            results["lstm_monthly_std"] = pred_lstm.std()
+            results["lstm_growth_pct"] = ((pred_lstm.mean() - prev_month_avg) / prev_month_avg) * 100
+            print(f"\n[LSTM Monthly Forecast]")
+            print(f"  Predicted Avg:   {pred_lstm.mean():,.1f} MW")
+            print(f"  Predicted Range: {pred_lstm.min():,.1f} - {pred_lstm.max():,.1f} MW")
+            print(f"  Growth vs Prev:  {results['lstm_growth_pct']:+.2f}%")
+    
+    # Ensemble monthly forecast
+    if model_type == "both":
+        if "xgboost_monthly_avg" in results and "lstm_monthly_avg" in results:
+            ensemble_avg = (results["xgboost_monthly_avg"] + results["lstm_monthly_avg"]) / 2
+            ensemble_growth = ((ensemble_avg - prev_month_avg) / prev_month_avg) * 100
+            results["ensemble_monthly_avg"] = ensemble_avg
+            results["ensemble_growth_pct"] = ensemble_growth
+            results["monthly_demand_forecast"] = ensemble_avg
+            results["monthly_growth_pct"] = ensemble_growth
+            print(f"\n[Ensemble Monthly Forecast]")
+            print(f"  Predicted Avg:   {ensemble_avg:,.1f} MW")
+            print(f"  Growth vs Prev:  {ensemble_growth:+.2f}%")
+        else:
+            results["monthly_demand_forecast"] = results.get("xgboost_monthly_avg", prev_month_avg)
+    elif model_type == "xgboost":
+        results["monthly_demand_forecast"] = results.get("xgboost_monthly_avg", prev_month_avg)
+    elif model_type == "lstm":
+        results["monthly_demand_forecast"] = results.get("lstm_monthly_avg", prev_month_avg)
+    
+    # Calculate expected range for next month
+    if "monthly_demand_forecast" in results:
+        forecast_avg = results["monthly_demand_forecast"]
+        forecast_std = results.get("ensemble_monthly_std", prev_month_std)
+        results["monthly_demand_range"] = (
+            forecast_avg - 1.96 * forecast_std,  # 95% confidence lower bound
+            forecast_avg + 1.96 * forecast_std,  # 95% confidence upper bound
+        )
+    
+    return results
+
 print("\n[Functions] Prediction functions loaded and ready!")
-print("  → Call predict_future_demand(new_data_df) to forecast")
+print("  → Call predict_future_demand(new_data_df) for hourly/daily forecasts")
+print("  → Call predict_monthly_demand(prev_month_df) for monthly forecasts")
 print("  → new_data_df must have: Demand, Temperature, Humidity, hour, dayofweek, month, year, dayofyear")
 print("Done ✓")
